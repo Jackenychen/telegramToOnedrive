@@ -1,0 +1,7 @@
+config.ini
+*.session
+*.session-journal
+processed.json
+tmp/
+venv/
+__pycache__/

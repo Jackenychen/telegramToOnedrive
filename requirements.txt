@@ -1,0 +1,2 @@
+telethon>=1.36,<2
+cryptg>=0.4          # C 实现的 AES，大幅提升下载/解密吞吐（缺它会退回纯 Python pyaes，很慢）

@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Saved Messages -> OneDrive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 改成目标 VPS 上的实际部署路径
+WorkingDirectory=/root/telegram
+ExecStart=/root/telegram/venv/bin/python /root/telegram/tg_to_onedrive.py
+Restart=on-failure
+RestartSec=10
+# 资源护栏（可选）：超内存上限即重启，避免拖累同机的 91 项目
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
