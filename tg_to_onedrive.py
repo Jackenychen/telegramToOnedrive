@@ -11,6 +11,7 @@ Telegram「收藏」/ 频道 → OneDrive 自动转存
 设计要点：
   * 串行处理 + 处理间隔，平滑 CPU/IO 并降低 FloodWait 概率
   * 用 message id 去重，重启不会重复转存
+  * 启动时按 processed 最大 id 增量补漏（停机期间漏传）；冷启动可用 backfill_limit
   * rclone moveto = 上传成功后自动删除本地源文件（"传完删本地"）
   * 文件名取自视频 caption，命中 91 项目「[标签] 标题 - 作者」解析规则
   * 相册(media group)整组识别：共享 caption 套到组内所有视频，加 _01/_02 序号
@@ -292,6 +293,33 @@ async def worker(client) -> None:
         await asyncio.sleep(MIN_INTERVAL)   # 控速
 
 
+# --------------------------- 启动补漏 ---------------------------
+
+async def enqueue_backlog(client, target, *, limit=None, min_id=None) -> int:
+    """把 iter_messages 拉取的一批消息里未处理视频入队。返回入队视频条数。"""
+    kwargs = {}
+    if limit is not None:
+        kwargs["limit"] = limit
+    if min_id is not None:
+        kwargs["min_id"] = min_id
+    recent = [m async for m in client.iter_messages(target, **kwargs)]
+    groups: dict = {}
+    queued = 0
+    for m in recent:
+        gid = getattr(m, "grouped_id", None)
+        if gid is not None:
+            groups.setdefault(gid, []).append(m)
+        elif is_video(m) and m.id not in PROCESSED:
+            await QUEUE.put((m, build_filename(m)))
+            queued += 1
+    for members in groups.values():
+        for m, name in album_names(members):
+            if m.id not in PROCESSED:
+                await QUEUE.put((m, name))
+                queued += 1
+    return queued
+
+
 # --------------------------- 主流程 ---------------------------
 
 async def main() -> None:
@@ -333,22 +361,19 @@ async def main() -> None:
         if is_video(msg) and msg.id not in PROCESSED:
             await QUEUE.put((msg, build_filename(msg)))
 
-    if BACKFILL_LIMIT > 0:
-        log.info("回扫最近 %d 条补漏…", BACKFILL_LIMIT)
-        # 先全部取回再按 grouped_id 归组，相册才能正确编号
-        # （注意：limit 若刚好截断某相册，该组编号/数量会不准；backfill 默认关闭）
-        recent = [m async for m in client.iter_messages(target, limit=BACKFILL_LIMIT)]
-        groups: dict = {}
-        for m in recent:
-            gid = getattr(m, "grouped_id", None)
-            if gid is not None:
-                groups.setdefault(gid, []).append(m)
-            elif is_video(m) and m.id not in PROCESSED:
-                await QUEUE.put((m, build_filename(m)))
-        for members in groups.values():
-            for m, name in album_names(members):
-                if m.id not in PROCESSED:
-                    await QUEUE.put((m, name))
+    # 有 processed 记录时：始终按最大 id 增量补漏（覆盖停机期间漏传，无需 backfill_limit>0）
+    if PROCESSED:
+        watermark = max(PROCESSED)
+        log.info("增量补漏：拉取 id > %d 的未处理消息…", watermark)
+        queued = await enqueue_backlog(client, target, min_id=watermark)
+        log.info("增量补漏完成，入队 %d 条视频", queued)
+    elif BACKFILL_LIMIT > 0:
+        # 冷启动：processed 为空时回扫最近 N 条（limit 截断相册时编号可能不准）
+        log.info("冷启动回扫最近 %d 条…", BACKFILL_LIMIT)
+        queued = await enqueue_backlog(client, target, limit=BACKFILL_LIMIT)
+        log.info("冷启动回扫完成，入队 %d 条视频", queued)
+    else:
+        log.info("processed 为空且 backfill_limit=0，不拉历史，仅监听新消息")
 
     log.info("开始监听 source=%s，等待新视频…（Ctrl+C 退出）", SOURCE)
     await client.run_until_disconnected()
