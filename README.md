@@ -27,7 +27,6 @@ Telethon 监听 → message id 去重 → 串行下载上传
 | `fast_download.py` | 并行下载 + 连接池 |
 | `config.example.ini` | 配置模板 |
 | `scan_backlog.py` / `bench_dl.py` | 估积压 / 测速（可选） |
-| `迁移清单.md` | 打包迁移步骤 |
 | `部署使用说明.md` | 运维说明 |
 
 勿提交 git：`config.ini`、`*.session`、`processed.json`
@@ -62,4 +61,4 @@ systemctl restart tg-onedrive
 | `FloodWait` | 调大 `min_interval_sec` 或减小 `connections` |
 | `rclone 失败` | `rclone lsd onedrive:` |
 
-详见 **`部署使用说明.md`**、**`迁移清单.md`**。
+详见 **`部署使用说明.md`**。
