@@ -84,6 +84,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+logging.getLogger("telethon").setLevel(logging.WARNING)  # 压低 difference 等 INFO 刷屏
 log = logging.getLogger("tg2od")
 
 

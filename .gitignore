@@ -5,3 +5,6 @@ processed.json
 tmp/
 venv/
 __pycache__/
+
+# 本地 Git 学习笔记，仅本机保留
+git学习笔记.md
