@@ -32,7 +32,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -74,6 +73,8 @@ MIN_INTERVAL = CFG.getfloat("download", "min_interval_sec", fallback=5.0)
 MAX_FILESIZE_MB = CFG.getint("download", "max_filesize_mb", fallback=0)
 # 并行下载连接数（仅 Premium 建议 >1；免费号并行易触发 FloodWait）
 CONNECTIONS = CFG.getint("download", "connections", fallback=1)
+SENDER_POOL_IDLE_SEC = CFG.getint("download", "sender_pool_idle_sec", fallback=60)
+WARM_REMOTE_CACHE = CFG.getboolean("download", "warm_remote_cache", fallback=False)
 
 STATE_FILE = (BASE_DIR / CFG.get("state", "processed_file", fallback="processed.json")).resolve()
 
@@ -193,51 +194,82 @@ def album_names(messages) -> list:
     return out
 
 
-# --------------------------- rclone 上传 ---------------------------
+# --------------------------- rclone（异步子进程 + 远端文件名缓存）---------------------------
 
-def rclone_moveto(local: Path, name: str) -> None:
-    target = f"{REMOTE}:{DEST_DIR}/{name}" if DEST_DIR else f"{REMOTE}:{name}"
-    log.info("rclone 上传 → %s", target)
-    res = subprocess.run(
-        [RCLONE, "moveto", str(local), target, "--no-traverse"],
-        capture_output=True, text=True,
+_REMOTE_EXISTS: set[str] = set()   # 进程内：已确认存在或本服务已上传的文件名
+
+
+def _rclone_target(name: str) -> str:
+    return f"{REMOTE}:{DEST_DIR}/{name}" if DEST_DIR else f"{REMOTE}:{name}"
+
+
+def _rclone_dir_target() -> str:
+    return f"{REMOTE}:{DEST_DIR}/" if DEST_DIR else f"{REMOTE}:"
+
+
+def _note_remote_name(name: str) -> None:
+    _REMOTE_EXISTS.add(name)
+
+
+async def _rclone_run(*args: str) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        RCLONE, *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    if res.returncode != 0:
-        raise RuntimeError(f"rclone 失败({res.returncode}): {res.stderr.strip()}")
-    # moveto 成功后源文件已被自动删除
+    stdout, stderr = await proc.communicate()
+    err = (stderr or b"").decode(errors="replace").strip()
+    out = (stdout or b"").decode(errors="replace").strip()
+    return proc.returncode or 0, err or out
 
 
-def remote_exists(name: str) -> bool:
-    """OneDrive 目标目录里是否已有同名文件。
+async def remote_exists_async(name: str) -> bool:
+    """OneDrive 是否已有同名文件。先查内存缓存，未命中再 rclone lsf。"""
+    if name in _REMOTE_EXISTS:
+        return True
+    code, out = await _rclone_run("lsf", _rclone_target(name))
+    exists = code == 0 and bool(out.strip())
+    if exists:
+        _note_remote_name(name)
+    return exists
 
-    `rclone lsf <文件路径>`：存在则 exit 0 并打印文件名；不存在报
-    "directory not found" 非 0 退出。文件名按精确路径查询，不当作 glob，
-    含 [标签] 方括号也安全。
-    """
-    target = f"{REMOTE}:{DEST_DIR}/{name}" if DEST_DIR else f"{REMOTE}:{name}"
-    res = subprocess.run([RCLONE, "lsf", target], capture_output=True, text=True)
-    return res.returncode == 0 and bool(res.stdout.strip())
+
+async def rclone_moveto_async(local: Path, name: str) -> None:
+    target = _rclone_target(name)
+    log.info("rclone 上传 → %s", target)
+    code, err = await _rclone_run("moveto", str(local), target, "--no-traverse")
+    if code != 0:
+        raise RuntimeError(f"rclone 失败({code}): {err}")
+    _note_remote_name(name)
 
 
-def resolve_unique_name(name: str, msg) -> str:
-    """目标已存在时在扩展名前补后缀，避免覆盖 OneDrive 上的同名文件。
-
-    依次尝试 _日期、_消息id，仍冲突再用 _id_序号 兜底。带文字的标题(单条/相册)
-    本身不含 id，最容易撞名(如两次都叫"旅行")；无文字命名已带唯一 id，通常直接通过。
-    """
-    if not remote_exists(name):
+async def resolve_unique_name_async(name: str, msg) -> str:
+    """目标已存在时在扩展名前补后缀，避免覆盖 OneDrive 上的同名文件。"""
+    if not await remote_exists_async(name):
         return name
     stem, ext = os.path.splitext(name)
     for suffix in (msg.date.strftime("%Y%m%d"), str(msg.id)):
         cand = f"{stem}_{suffix}{ext}"
-        if not remote_exists(cand):
+        if not await remote_exists_async(cand):
             return cand
     n = 2
     while True:
         cand = f"{stem}_{msg.id}_{n}{ext}"
-        if not remote_exists(cand):
+        if not await remote_exists_async(cand):
             return cand
         n += 1
+
+
+async def warm_remote_cache_async() -> None:
+    if not WARM_REMOTE_CACHE:
+        return
+    code, out = await _rclone_run("lsf", _rclone_dir_target(), "--files-only")
+    if code != 0:
+        log.warning("预热远端文件名缓存失败：%s", out)
+        return
+    names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    _REMOTE_EXISTS.update(names)
+    log.info("预热远端文件名缓存：%d 个", len(names))
 
 
 # --------------------------- 处理与队列 ---------------------------
@@ -256,7 +288,7 @@ async def transfer(client, msg, name: str) -> None:
         save_processed(PROCESSED)
         return
 
-    unique = resolve_unique_name(name, msg)
+    unique = await resolve_unique_name_async(name, msg)
     if unique != name:
         log.info("目标已存在，改名避免覆盖：%s → %s", name, unique)
     name = unique
@@ -267,7 +299,7 @@ async def transfer(client, msg, name: str) -> None:
     try:
         log.info("下载 id=%s (%.1fMB, %d连接) → %s", msg.id, (size or 0) / 1048576, CONNECTIONS, name)
         await fast_download.download_smart(client, msg, str(local), connections=CONNECTIONS, log=log)
-        rclone_moveto(local, name)
+        await rclone_moveto_async(local, name)
         PROCESSED.add(msg.id)
         save_processed(PROCESSED)
         log.info("完成 id=%s", msg.id)
@@ -326,57 +358,65 @@ async def main() -> None:
     global QUEUE
     QUEUE = asyncio.Queue()
 
+    fast_download.configure_pool(SENDER_POOL_IDLE_SEC)
+
     client = TelegramClient(str(BASE_DIR / SESSION_NAME), API_ID, API_HASH)
-    await client.start()                    # 首次交互登录；已有 session 直接复用
-    me = await client.get_me()
-    log.info("已登录：%s (id=%s, Premium=%s)", me.first_name or me.username, me.id, getattr(me, "premium", False))
+    try:
+        await client.start()                    # 首次交互登录；已有 session 直接复用
+        me = await client.get_me()
+        log.info("已登录：%s (id=%s, Premium=%s)", me.first_name or me.username, me.id, getattr(me, "premium", False))
+        await warm_remote_cache_async()
 
-    if SOURCE.lower() in ("me", "self", "saved"):
-        source = "me"
-    elif re.fullmatch(r"-?\d+", SOURCE.strip()):
-        # 纯数字(群/频道 ID)转 int，否则 Telethon 会把 -5217033513 误当手机号
-        source = int(SOURCE.strip())
-    else:
-        source = SOURCE
-    target = await client.get_entity(source)
+        if SOURCE.lower() in ("me", "self", "saved"):
+            source = "me"
+        elif re.fullmatch(r"-?\d+", SOURCE.strip()):
+            # 纯数字(群/频道 ID)转 int，否则 Telethon 会把 -5217033513 误当手机号
+            source = int(SOURCE.strip())
+        else:
+            source = SOURCE
+        target = await client.get_entity(source)
 
-    asyncio.create_task(worker(client))
+        asyncio.create_task(worker(client))
 
-    # 相册(media group)：整组一起处理，caption 套用到组内所有视频并加序号。
-    # Album 事件只对 grouped_id 非空的消息触发，且每组只触发一次。
-    @client.on(events.Album(chats=target))
-    async def _on_album(event):
-        for m, name in album_names(event.messages):
-            if m.id not in PROCESSED:
-                await QUEUE.put((m, name))
+        # 相册(media group)：整组一起处理，caption 套用到组内所有视频并加序号。
+        # Album 事件只对 grouped_id 非空的消息触发，且每组只触发一次。
+        @client.on(events.Album(chats=target))
+        async def _on_album(event):
+            for m, name in album_names(event.messages):
+                if m.id not in PROCESSED:
+                    await QUEUE.put((m, name))
 
-    # 单条(非相册)视频。func 过滤掉 grouped 消息，交给上面的 Album，避免重复处理。
-    # incoming+outgoing 都开：收藏里的消息是 outgoing，频道里的是 incoming
-    @client.on(events.NewMessage(
-        chats=target, incoming=True, outgoing=True,
-        func=lambda e: getattr(e.message, "grouped_id", None) is None,
-    ))
-    async def _on_new(event):
-        msg = event.message
-        if is_video(msg) and msg.id not in PROCESSED:
-            await QUEUE.put((msg, build_filename(msg)))
+        # 单条(非相册)视频。func 过滤掉 grouped 消息，交给上面的 Album，避免重复处理。
+        # incoming+outgoing 都开：收藏里的消息是 outgoing，频道里的是 incoming
+        @client.on(events.NewMessage(
+            chats=target, incoming=True, outgoing=True,
+            func=lambda e: getattr(e.message, "grouped_id", None) is None,
+        ))
+        async def _on_new(event):
+            msg = event.message
+            if is_video(msg) and msg.id not in PROCESSED:
+                await QUEUE.put((msg, build_filename(msg)))
 
-    # 有 processed 记录时：始终按最大 id 增量补漏（覆盖停机期间漏传，无需 backfill_limit>0）
-    if PROCESSED:
-        watermark = max(PROCESSED)
-        log.info("增量补漏：拉取 id > %d 的未处理消息…", watermark)
-        queued = await enqueue_backlog(client, target, min_id=watermark)
-        log.info("增量补漏完成，入队 %d 条视频", queued)
-    elif BACKFILL_LIMIT > 0:
-        # 冷启动：processed 为空时回扫最近 N 条（limit 截断相册时编号可能不准）
-        log.info("冷启动回扫最近 %d 条…", BACKFILL_LIMIT)
-        queued = await enqueue_backlog(client, target, limit=BACKFILL_LIMIT)
-        log.info("冷启动回扫完成，入队 %d 条视频", queued)
-    else:
-        log.info("processed 为空且 backfill_limit=0，不拉历史，仅监听新消息")
+        # 有 processed 记录时：始终按最大 id 增量补漏（覆盖停机期间漏传，无需 backfill_limit>0）
+        if PROCESSED:
+            watermark = max(PROCESSED)
+            log.info("增量补漏：拉取 id > %d 的未处理消息…", watermark)
+            queued = await enqueue_backlog(client, target, min_id=watermark)
+            log.info("增量补漏完成，入队 %d 条视频", queued)
+        elif BACKFILL_LIMIT > 0:
+            # 冷启动：processed 为空时回扫最近 N 条（limit 截断相册时编号可能不准）
+            log.info("冷启动回扫最近 %d 条…", BACKFILL_LIMIT)
+            queued = await enqueue_backlog(client, target, limit=BACKFILL_LIMIT)
+            log.info("冷启动回扫完成，入队 %d 条视频", queued)
+        else:
+            log.info("processed 为空且 backfill_limit=0，不拉历史，仅监听新消息")
 
-    log.info("开始监听 source=%s，等待新视频…（Ctrl+C 退出）", SOURCE)
-    await client.run_until_disconnected()
+        log.info("开始监听 source=%s，等待新视频…（Ctrl+C 退出）", SOURCE)
+        await client.run_until_disconnected()
+    finally:
+        await fast_download.close_pool()
+        if client.is_connected():
+            await client.disconnect()
 
 
 if __name__ == "__main__":

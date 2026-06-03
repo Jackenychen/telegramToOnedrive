@@ -13,6 +13,7 @@ Telethon 默认 download_media 走单条连接，受限于单管道吞吐（实�
     且导出鉴权是一次性的，并发建会互相覆盖 → "authorization is invalid"。
     所以导出鉴权只做一次（第一条连接），其余连接复用其已授权的 auth_key——既避开
     竞态又省往返。文件在主 DC 时直接复用主连接 auth_key。下载本身仍并行。
+  * SenderPool：按 (DC, 连接数) 复用连接；空闲超过 sender_pool_idle_sec 后关闭。
   * 共享 offset 计数器做 work-stealing：抢 offset 的动作在 await 前同步完成，
     单线程 asyncio 下无竞态；os.pwrite 按绝对偏移写，无需文件锁。
   * file_reference 过期（积压相册排队太久，入队时的令牌失效）：重新拉取消息换新
@@ -23,6 +24,7 @@ Telethon 默认 download_media 走单条连接，受限于单管道吞吐（实�
 """
 import asyncio
 import os
+import time
 
 from telethon import utils
 from telethon.errors import (
@@ -40,6 +42,97 @@ MIN_PARALLEL_SIZE = 5 * 1024 * 1024  # 小于此值不并行：建连/导出鉴�
 
 class _NeedFallback(Exception):
     """并行路径无法安全处理，需回退到 download_media。"""
+
+
+class _PoolEntry:
+    __slots__ = ("senders", "last_used")
+
+    def __init__(self, senders: list):
+        self.senders = senders
+        self.last_used = time.monotonic()
+
+
+class SenderPool:
+    """按 (DC, 连接数) 复用 MTProtoSender；空闲超时后 disconnect。"""
+
+    def __init__(self, idle_sec: float = 60.0):
+        self.idle_sec = float(idle_sec)
+        self._entries: dict[tuple[int, int], _PoolEntry] = {}
+
+    @staticmethod
+    def _key(client, dc_id, count: int) -> tuple[int, int]:
+        effective = (
+            client.session.dc_id
+            if dc_id is None or dc_id == client.session.dc_id
+            else dc_id
+        )
+        return (effective, count)
+
+    @staticmethod
+    async def _disconnect_all(senders: list) -> None:
+        for s in senders:
+            try:
+                await s.disconnect()
+            except Exception:
+                pass
+
+    async def _evict_idle(self) -> None:
+        if self.idle_sec <= 0:
+            return
+        now = time.monotonic()
+        for key, entry in list(self._entries.items()):
+            if now - entry.last_used > self.idle_sec:
+                await self._disconnect_all(entry.senders)
+                del self._entries[key]
+
+    async def acquire(self, client, dc_id, count: int) -> list:
+        await self._evict_idle()
+        key = self._key(client, dc_id, count)
+        entry = self._entries.get(key)
+        if entry is not None:
+            entry.last_used = time.monotonic()
+            return entry.senders
+        senders = await _make_senders(client, dc_id, count)
+        self._entries[key] = _PoolEntry(senders)
+        return senders
+
+    async def release(self, client, dc_id, count: int) -> None:
+        key = self._key(client, dc_id, count)
+        entry = self._entries.get(key)
+        if entry is not None:
+            entry.last_used = time.monotonic()
+
+    async def discard(self, client, dc_id, count: int) -> None:
+        key = self._key(client, dc_id, count)
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            await self._disconnect_all(entry.senders)
+
+    async def close_all(self) -> None:
+        for entry in list(self._entries.values()):
+            await self._disconnect_all(entry.senders)
+        self._entries.clear()
+
+
+_pool: SenderPool | None = None
+
+
+def configure_pool(idle_sec: float) -> None:
+    global _pool
+    _pool = SenderPool(idle_sec)
+
+
+def get_pool() -> SenderPool:
+    global _pool
+    if _pool is None:
+        _pool = SenderPool(60.0)
+    return _pool
+
+
+async def close_pool() -> None:
+    global _pool
+    if _pool is not None:
+        await _pool.close_all()
 
 
 async def _connect_with_key(client, dc, auth_key) -> MTProtoSender:
@@ -79,7 +172,8 @@ async def _make_senders(client, dc_id, count) -> list:
 async def _run_parallel(client, dc_id, location, size, dest_path, connections, request_size) -> int:
     """用多连接并行把文件拉到 dest_path，返回写入字节数。
     file_reference 过期会从这里向上抛 FileReferenceExpiredError，交给 fast_download 刷新重试。"""
-    senders = await _make_senders(client, dc_id, connections)
+    pool = get_pool()
+    senders = await pool.acquire(client, dc_id, connections)
     next_offset = 0
     written = 0
     fd = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -104,18 +198,15 @@ async def _run_parallel(client, dc_id, location, size, dest_path, connections, r
     try:
         os.ftruncate(fd, size)              # 预分配，便于各 worker 按偏移稀疏写
         await asyncio.gather(*tasks)
+        await pool.release(client, dc_id, connections)
     except BaseException:
+        await pool.discard(client, dc_id, connections)
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)   # 等其余 worker 收尾
         raise
     finally:
         os.close(fd)
-        for s in senders:
-            try:
-                await s.disconnect()
-            except Exception:
-                pass
     return written
 
 
